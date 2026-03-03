@@ -1,0 +1,18 @@
+# OpenPipeFlow — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# GUI framework
+PyQt6>=6.6.0
+
+# Hydraulic network solver (Fraunhofer IEE / Uni Kassel, BSD-3-Clause)
+pandapipes>=0.10.0
+
+# Numerics (also required by pandapipes)
+numpy>=1.26.0
+scipy>=1.12.0
+
+# EXE packaging (dev only)
+pyinstaller>=6.3.0
+
+# Optional — live plotting in PID panel
+# pyqtgraph>=0.13.3

@@ -1,0 +1,53 @@
+{
+  "_comment": "Built-in fluid presets for OpenPipeFlow. Units: density=kg/m³, viscosity=Pa·s",
+  "fluids": [
+    {
+      "key": "water",
+      "label": "Water (20°C)",
+      "density_kg_m3": 998.2,
+      "viscosity_pa_s": 1.002e-3,
+      "temperature_c": 20,
+      "pandapipes_key": "water"
+    },
+    {
+      "key": "water_5c",
+      "label": "Water (5°C)",
+      "density_kg_m3": 999.9,
+      "viscosity_pa_s": 1.519e-3,
+      "temperature_c": 5,
+      "pandapipes_key": "water"
+    },
+    {
+      "key": "water_80c",
+      "label": "Water (80°C)",
+      "density_kg_m3": 971.8,
+      "viscosity_pa_s": 3.54e-4,
+      "temperature_c": 80,
+      "pandapipes_key": "water"
+    },
+    {
+      "key": "air",
+      "label": "Air (20°C, 1 atm)",
+      "density_kg_m3": 1.204,
+      "viscosity_pa_s": 1.81e-5,
+      "temperature_c": 20,
+      "pandapipes_key": "air"
+    },
+    {
+      "key": "crude_oil",
+      "label": "Light Crude Oil",
+      "density_kg_m3": 850.0,
+      "viscosity_pa_s": 5.0e-3,
+      "temperature_c": 20,
+      "pandapipes_key": "water"
+    },
+    {
+      "key": "hydraulic_oil_vg46",
+      "label": "Hydraulic Oil ISO VG 46",
+      "density_kg_m3": 870.0,
+      "viscosity_pa_s": 0.046,
+      "temperature_c": 40,
+      "pandapipes_key": "water"
+    }
+  ]
+}
