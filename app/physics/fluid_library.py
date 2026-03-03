@@ -1,9 +1,13 @@
 """
 OpenPipeFlow — Fluid library.
 
-Wraps pandapipes built-in fluids and provides display metadata.
-Falls back to hard-coded values if pandapipes is not importable
-(useful during development before full dependencies are installed).
+Priority order for property data:
+  1. pandapipes built-in fluids (most accurate for the solver's own data)
+  2. fluids package (Caleb Bell et al.) for density / viscosity at temperature
+  3. Hard-coded fallback values at 20 °C
+
+The solver always uses pandapipes fluid data internally; this module is used
+for display values in the UI and for the fallback Darcy-Weisbach solver.
 """
 
 from __future__ import annotations
@@ -13,6 +17,12 @@ try:
     _PP_AVAILABLE = True
 except ImportError:
     _PP_AVAILABLE = False
+
+try:
+    import fluids
+    _FLUIDS_AVAILABLE = True
+except ImportError:
+    _FLUIDS_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Hard-coded fallback values for display (density kg/m³, viscosity Pa·s at 20°C)
@@ -56,7 +66,7 @@ _PP_NAME_MAP: dict[str, str] = {
     "water_5c":           "water",
     "water_80c":          "water",
     "air":                "air",
-    "crude_oil":          "water",   # no direct equivalent; use water as placeholder
+    "crude_oil":          "water",
     "hydraulic_oil_vg46": "water",
 }
 
@@ -65,17 +75,39 @@ AVAILABLE_FLUIDS: list[str] = list(_FALLBACK.keys())
 
 
 def get_fluid_display(fluid_name: str) -> dict:
-    """Return a dict with label, density_kg_m3, viscosity_pa_s for GUI display."""
+    """
+    Return a dict with label, density_kg_m3, viscosity_pa_s for UI display.
+
+    Data source priority:
+      1. pandapipes (uses its own fluid tables at 20°C)
+      2. fluids package (uses its own IAPWS-97 / correlations)
+      3. hard-coded fallback
+    """
     info = _FALLBACK.get(fluid_name, _FALLBACK["water"]).copy()
+
     if _PP_AVAILABLE:
         try:
             net = pp.create_empty_network(fluid=_PP_NAME_MAP.get(fluid_name, "water"))
             fluid = pp.get_fluid(net)
-            T = 293.15
+            T = 293.15  # 20°C
             info["density_kg_m3"]  = float(fluid.get_density(T))
             info["viscosity_pa_s"] = float(fluid.get_dyn_viscosity(T))
+            return info
         except Exception:
-            pass   # stay with fallback
+            pass   # fall through to fluids or hard-coded
+
+    if _FLUIDS_AVAILABLE and fluid_name in ("water", "water_5c", "water_80c"):
+        # fluids.IAPWS97 provides accurate water properties
+        T_map = {"water": 293.15, "water_5c": 278.15, "water_80c": 353.15}
+        T = T_map.get(fluid_name, 293.15)
+        try:
+            water = fluids.IAPWS97(T=T, P=1e5)
+            info["density_kg_m3"]  = float(water.rho)
+            info["viscosity_pa_s"] = float(water.mu)
+            return info
+        except Exception:
+            pass
+
     return info
 
 
@@ -86,3 +118,7 @@ def get_pandapipes_fluid_name(fluid_name: str) -> str:
 
 def pandapipes_available() -> bool:
     return _PP_AVAILABLE
+
+
+def fluids_available() -> bool:
+    return _FLUIDS_AVAILABLE

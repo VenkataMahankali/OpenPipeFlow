@@ -11,6 +11,10 @@ pandapipes>=0.10.0
 numpy>=1.26.0
 scipy>=1.12.0
 
+# Fluid dynamics (ISO 5167 orifice Cd, friction factors, fitting losses)
+# Caleb Bell et al., MIT License — https://github.com/CalebBell/fluids
+fluids>=1.0.0
+
 # EXE packaging (dev only)
 pyinstaller>=6.3.0
 

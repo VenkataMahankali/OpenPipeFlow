@@ -116,9 +116,22 @@ class ValveData:
 
     # Flow coefficient (Cv in US gpm/psi^0.5; Kv in m³/h/bar^0.5)
     cv_usgpm: Optional[float] = None
-    # Orifice-specific
-    bore_diameter_m: Optional[float] = None   # bore / throat diameter
-    cd: float = 0.61                           # discharge coefficient
+
+    # Orifice-specific geometry and overrides
+    bore_diameter_m: Optional[float] = None   # bore / throat diameter [m]
+    tap_type: str = "flange"                   # "corner" | "flange" | "D"
+
+    # Overrides — None means "auto-calculate from ISO 5167"
+    cd_override: Optional[float] = None        # force a specific Cd
+    k_override: Optional[float] = None         # force a specific K (bypasses Cd + geometry)
+
+    # Legacy field (kept for file compatibility); use cd_override instead
+    cd: float = 0.61
+
+    # Computed orifice results (set by solver, read-only in UI)
+    result_cd:    Optional[float] = None
+    result_beta:  Optional[float] = None
+    result_k_iso: Optional[float] = None       # K computed from ISO 5167
 
     result_velocity_ms: Optional[float] = None
     result_flow_m3s: Optional[float] = None
@@ -135,10 +148,28 @@ class ValveData:
 
     @property
     def effective_k(self) -> float:
-        """K-factor adjusted for partial opening."""
+        """K-factor adjusted for partial opening (or computed for orifice)."""
+        if self.valve_type == "orifice":
+            # Orifices are always fully open (no open_pct control)
+            if self.k_override is not None:
+                return float(self.k_override)
+            if self.result_k_iso is not None:
+                return float(self.result_k_iso)
+            # Pre-solve fallback: compute from geometry + default Cd
+            import math
+            d_bore = self.bore_diameter_m or 0.0
+            d_pipe = self.diameter_m or 0.1
+            if d_bore > 0 and d_pipe > 0:
+                Cd   = float(self.cd_override or self.cd or 0.61)
+                beta = d_bore / d_pipe
+                if 0 < beta < 1 and Cd > 0:
+                    num = math.sqrt(1.0 - beta**4) / (Cd * beta**2)
+                    return max(num**2 - (1.0 - beta**4), 0.0)
+            return self.k_factor  # absolute fallback
+
         if self.open_pct <= 0.0:
             return 1e9   # effectively closed
-        # Gate valve: K scales inversely with opening
+        # Gate/ball/etc: K scales inversely with opening fraction
         base_k = self.k_factor
         factor = 1.0 / max(self.open_pct / 100.0, 0.01) ** 2
         return base_k * factor

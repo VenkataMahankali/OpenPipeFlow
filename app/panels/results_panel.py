@@ -26,7 +26,7 @@ class ResultsPanel(QWidget):
         "Tag", "Name", "Type",
         "Flow Rate (L/min)", "Velocity (m/s)", "ΔP (bar)",
         "P_in (bar)", "P_out (bar)",
-        "Reynolds", "Regime"
+        "Re (pipe, ISO 5167)", "Regime"
     ]
     _MONO = QFont("Consolas", 10)
 

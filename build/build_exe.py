@@ -50,6 +50,13 @@ PyInstaller.__main__.run([
     "--hidden-import=PyQt6.QtGui",
     "--hidden-import=PyQt6.QtWidgets",
 
+    # fluids (ISO 5167, friction factors)
+    "--hidden-import=fluids",
+    "--hidden-import=fluids.flow_meter",
+    "--hidden-import=fluids.friction",
+    "--hidden-import=fluids.fittings",
+    "--collect-all=fluids",
+
     "--collect-all=pandapipes",
     "--collect-all=pandapower",   # pandapipes depends on pandapower
 

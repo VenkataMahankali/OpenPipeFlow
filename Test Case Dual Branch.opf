@@ -20,7 +20,7 @@
       "x": -380.0,
       "y": -60.0,
       "elevation_m": 0.0,
-      "pressure_bar": 3.0,
+      "pressure_bar": 1.0,
       "host_pipe_id": null,
       "alarm_min_pressure_bar": null,
       "alarm_max_pressure_bar": null,

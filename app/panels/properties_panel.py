@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QLineEdit, QDoubleSpinBox, QComboBox, QCheckBox, QGroupBox,
     QPushButton, QScrollArea, QSpinBox, QTableWidget,
-    QTableWidgetItem, QSizePolicy, QFrame, QHeaderView
+    QTableWidgetItem, QSizePolicy, QFrame, QHeaderView, QApplication
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -79,18 +79,73 @@ VALVE_K_DEFAULTS: dict[str, float] = {
 
 
 # ---------------------------------------------------------------------------
-# _NoScrollSpinBox — QDoubleSpinBox that never steals scroll events
+# Excel-style input widgets
 # ---------------------------------------------------------------------------
 
-class _NoScrollSpinBox(QDoubleSpinBox):
-    """QDoubleSpinBox that ignores scroll wheel and selects all on focus."""
+class ExcelStyleLineEdit(QLineEdit):
+    """
+    QLineEdit with Excel-style keyboard behaviour:
+      - Single click / focus → select all (start typing immediately replaces)
+      - Enter  → commit and move focus to next field
+      - Escape → cancel and restore the value that was present on focus-in
+    """
 
-    def wheelEvent(self, event):
-        event.ignore()  # Don't change value on scroll
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_text: str = ""
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
-        QTimer.singleShot(0, self.selectAll)  # Select all text on click
+        self._saved_text = self.text()
+        QTimer.singleShot(0, self.selectAll)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self.setText(self._saved_text)
+            self.clearFocus()
+            event.accept()
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._saved_text = self.text()
+            self.focusNextChild()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+
+class _NoScrollSpinBox(QDoubleSpinBox):
+    """
+    QDoubleSpinBox with Excel-style keyboard behaviour:
+      - Scroll wheel ignored (never changes value accidentally)
+      - Single click / focus → select all
+      - Enter  → commit and move focus to next field
+      - Escape → cancel and restore the value that was present on focus-in
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_value: float = 0.0
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._saved_value = self.value()
+        QTimer.singleShot(0, self.selectAll)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self.setValue(self._saved_value)
+            self.clearFocus()
+            event.accept()
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            super().keyPressEvent(event)   # let spinbox interpret / commit text
+            self._saved_value = self.value()
+            self.focusNextChild()
+        else:
+            super().keyPressEvent(event)
 
 
 class _SectionHeader(QLabel):
@@ -164,9 +219,14 @@ class PropertiesPanel(QWidget):
         else:
             self._title_label.setText("Unknown element")
 
+    def _is_editing(self) -> bool:
+        """True if any input widget inside this panel currently has keyboard focus."""
+        fw = QApplication.focusWidget()
+        return fw is not None and self.isAncestorOf(fw)
+
     def update_results(self):
-        """Refresh result fields without rebuilding the full form."""
-        if self._current_id:
+        """Refresh result fields — skipped while user is actively editing."""
+        if self._current_id and not self._is_editing():
             self.show_element(self._current_id)
 
     def refresh(self):
@@ -198,7 +258,7 @@ class PropertiesPanel(QWidget):
         grp = self._group("Identification")
         fl = QFormLayout(grp)
         fl.setSpacing(5)
-        name_e = QLineEdit(node.name)
+        name_e = ExcelStyleLineEdit(node.name)
         name_e.textChanged.connect(lambda t: self._update_node(node, name=t))
         fl.addRow("Tag / Name:", name_e)
 
@@ -251,7 +311,7 @@ class PropertiesPanel(QWidget):
         grp1 = self._group("Identification")
         fl1 = QFormLayout(grp1)
         fl1.setSpacing(5)
-        name_e = QLineEdit(pipe.name)
+        name_e = ExcelStyleLineEdit(pipe.name)
         name_e.textChanged.connect(lambda t: self._update_pipe(pipe, name=t))
         fl1.addRow("Tag / Name:", name_e)
         self._insert(grp1)
@@ -340,7 +400,7 @@ class PropertiesPanel(QWidget):
                 rl.addRow("Pressure drop:", self._result_lbl(
                     self._fmt_p(pipe.result_delta_p_bar)))
             if pipe.result_reynolds is not None:
-                rl.addRow("Reynolds:",  self._result_lbl(
+                rl.addRow("Re (pipe, ISO 5167):",  self._result_lbl(
                     f"{pipe.result_reynolds:.0f}  ({pipe.result_regime})"))
             self._insert(rg)
 
@@ -356,7 +416,7 @@ class PropertiesPanel(QWidget):
         grp1 = self._group("Identification")
         fl1 = QFormLayout(grp1)
         fl1.setSpacing(5)
-        name_e = QLineEdit(valve.name)
+        name_e = ExcelStyleLineEdit(valve.name)
         name_e.textChanged.connect(lambda t: self._update_valve(valve, name=t))
         fl1.addRow("Tag / Name:", name_e)
         vtype_box = QComboBox()
@@ -377,23 +437,88 @@ class PropertiesPanel(QWidget):
         fl2.addRow("Line diameter:", diam_spin)
 
         if is_orifice:
+            # ── Orifice geometry ──────────────────────────────────────────
             bore = valve.bore_diameter_m or valve.diameter_m * 0.5
             bore_spin = self._l_spin(bore)
             bore_spin.valueChanged.connect(
                 lambda v: self._update_valve(valve, bore_diameter_m=UNITS.l_to_si(v)))
             fl2.addRow("Bore diameter:", bore_spin)
 
-            cd_spin = self._dspin(0.1, 1.0, valve.cd, "", 3)
-            cd_spin.valueChanged.connect(lambda v: self._update_valve(valve, cd=v))
-            fl2.addRow("Cd (discharge):", cd_spin)
+            tap_box = QComboBox()
+            tap_box.addItems(["flange", "corner", "D"])
+            tap_box.setCurrentText(valve.tap_type)
+            tap_box.currentTextChanged.connect(
+                lambda t: self._update_valve(valve, tap_type=t))
+            fl2.addRow("Tap type:", tap_box)
 
+            # Beta — read-only computed
             if valve.bore_diameter_m and valve.diameter_m:
-                beta = valve.bore_diameter_m / valve.diameter_m
-                fl2.addRow("Beta ratio (d/D):", self._result_lbl(f"{beta:.3f}"))
+                beta_val = valve.result_beta or (valve.bore_diameter_m / valve.diameter_m)
+                fl2.addRow("β (bore/pipe):", self._result_lbl(f"{beta_val:.4f}"))
 
-            kf_spin = self._dspin(0.0, 100000, valve.k_factor, "", 3)
-            kf_spin.valueChanged.connect(lambda v: self._update_valve(valve, k_factor=v))
-            fl2.addRow("K-factor (override):", kf_spin)
+            # ── Cd — read-only by default; override checkbox ──────────────
+            cd_row_lbl = QLabel("Cd (ISO 5167):")
+            cd_disp    = valve.result_cd or valve.cd_override or valve.cd
+            cd_spin    = self._dspin(0.1, 1.0, cd_disp, "", 4)
+            cd_spin.setReadOnly(valve.cd_override is None)
+            cd_spin.setStyleSheet(
+                "" if valve.cd_override is not None
+                else "background: #1a1e24; color: #80c0a0;")
+            cd_spin.valueChanged.connect(
+                lambda v: self._update_valve(valve,
+                    cd_override=v if cd_override_cb.isChecked() else None))
+
+            cd_override_cb = QCheckBox("Override")
+            cd_override_cb.setChecked(valve.cd_override is not None)
+            def _toggle_cd(checked, _cs=cd_spin):
+                _cs.setReadOnly(not checked)
+                _cs.setStyleSheet("" if checked else "background: #1a1e24; color: #80c0a0;")
+                if not checked:
+                    self._update_valve(valve, cd_override=None)
+            cd_override_cb.toggled.connect(_toggle_cd)
+
+            cd_row = QWidget()
+            cd_hl  = QHBoxLayout(cd_row)
+            cd_hl.setContentsMargins(0, 0, 0, 0)
+            cd_hl.addWidget(cd_spin, 1)
+            cd_hl.addWidget(cd_override_cb)
+            fl2.addRow(cd_row_lbl, cd_row)
+
+            # ── K — read-only by default; override disables all geometry ──
+            k_row_lbl = QLabel("K (loss coeff):")
+            k_disp    = valve.k_override or valve.result_k_iso or valve.effective_k
+            k_spin    = self._dspin(0.0, 1e6, k_disp, "", 3)
+            k_spin.setReadOnly(valve.k_override is None)
+            k_spin.setStyleSheet(
+                "" if valve.k_override is not None
+                else "background: #1a1e24; color: #80c0a0;")
+            k_spin.valueChanged.connect(
+                lambda v: self._update_valve(valve,
+                    k_override=v if k_override_cb.isChecked() else None))
+
+            k_override_cb = QCheckBox("Override K")
+            k_override_cb.setChecked(valve.k_override is not None)
+            def _toggle_k(checked, _ks=k_spin, _cs=cd_spin, _cob=cd_override_cb,
+                          _tap=tap_box, _bore=bore_spin):
+                _ks.setReadOnly(not checked)
+                _ks.setStyleSheet("" if checked else "background: #1a1e24; color: #80c0a0;")
+                # When K is overridden, geometry inputs are display-only
+                for w in (_cs, _cob, _tap, _bore):
+                    w.setEnabled(not checked)
+                if not checked:
+                    self._update_valve(valve, k_override=None)
+            k_override_cb.toggled.connect(_toggle_k)
+            # Apply initial state
+            if valve.k_override is not None:
+                for w in (cd_spin, cd_override_cb, tap_box, bore_spin):
+                    w.setEnabled(False)
+
+            k_row = QWidget()
+            k_hl  = QHBoxLayout(k_row)
+            k_hl.setContentsMargins(0, 0, 0, 0)
+            k_hl.addWidget(k_spin, 1)
+            k_hl.addWidget(k_override_cb)
+            fl2.addRow(k_row_lbl, k_row)
         else:
             kf_spin = self._dspin(0.0, 100000, valve.k_factor, "", 3)
             kf_spin.valueChanged.connect(lambda v: self._update_valve(valve, k_factor=v))
@@ -425,8 +550,18 @@ class PropertiesPanel(QWidget):
                 rl.addRow("Pressure drop:", self._result_lbl(
                     self._fmt_p(valve.result_delta_p_bar)))
             if valve.result_reynolds is not None:
-                rl.addRow("Reynolds:",     self._result_lbl(
+                rl.addRow("Re (pipe, ISO 5167):",     self._result_lbl(
                     f"{valve.result_reynolds:.0f}  ({valve.result_regime})"))
+            # Orifice-specific computed results
+            if is_orifice:
+                if valve.result_cd is not None:
+                    src = "" if valve.cd_override is None else " (override)"
+                    rl.addRow("Cd (computed):",
+                              self._result_lbl(f"{valve.result_cd:.4f}{src}"))
+                if valve.result_k_iso is not None:
+                    src = "" if valve.k_override is None else " (override)"
+                    rl.addRow("K (computed):",
+                              self._result_lbl(f"{valve.result_k_iso:.3f}{src}"))
             self._insert(rg)
 
         self._content_layout.addStretch()
@@ -451,7 +586,7 @@ class PropertiesPanel(QWidget):
         grp1 = self._group("Identification")
         fl1 = QFormLayout(grp1)
         fl1.setSpacing(5)
-        name_e = QLineEdit(pump.name)
+        name_e = ExcelStyleLineEdit(pump.name)
         name_e.textChanged.connect(lambda t: self._update_pump(pump, name=t))
         fl1.addRow("Tag / Name:", name_e)
 

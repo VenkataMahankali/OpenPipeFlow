@@ -12,6 +12,7 @@ from typing import Optional
 
 from app.project.model import NetworkModel, PipeData, ValveData, PumpData
 from app.physics.fluid_library import get_pandapipes_fluid_name
+from app.physics.orifice_model import compute_orifice_K
 
 try:
     import pandapipes as pp
@@ -19,6 +20,12 @@ try:
     _PP = True
 except ImportError:
     _PP = False
+
+try:
+    import fluids as _fluids
+    _FLUIDS = True
+except ImportError:
+    _FLUIDS = False
 
 # ---------------------------------------------------------------------------
 # Regime classification
@@ -146,6 +153,15 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
         elif node.node_type == "sink":
             pp.create_ext_grid(net, junction=idx, p_bar=node.pressure_bar, t_k=293.15)
 
+    # ── Fluid properties (needed for orifice and pump calculations) ───────
+    try:
+        fluid_obj = pp.get_fluid(net)
+        rho_fluid  = float(fluid_obj.get_density(293.15))
+        mu_fluid   = float(fluid_obj.get_dyn_viscosity(293.15))
+    except Exception:
+        rho_fluid = 998.2
+        mu_fluid  = 1e-3
+
     # ── Pipe elements ──────────────────────────────────────────────────────
     pipe_idx_map: dict[str, int] = {}
     for pid, pipe in model.pipes.items():
@@ -169,11 +185,10 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
 
     # ── Valve elements ─────────────────────────────────────────────────────
     # CLOSED valves are NOT added to the pandapipes network.
-    # This creates a topological break: pandapipes sees dead-end pipe segments
-    # on each side, which it correctly solves with exactly zero flow and the
-    # appropriate static pressure (source pressure on inlet side, sink on outlet).
     # OPEN valves are modelled as short pipes with a K-factor loss.
-    valve_idx_map:    dict[str, int] = {}
+    # ORIFICES are tracked separately for Re-dependent Cd outer iteration.
+    valve_idx_map:    dict[str, int] = {}   # regular open valves
+    orifice_idx_map:  dict[str, int] = {}   # orifice plates (need outer iter)
     closed_valve_ids: set[str]       = set()
 
     for vid, valve in model.valves.items():
@@ -181,33 +196,62 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
             warnings.append(f"{vid}: endpoint not found, skipping.")
             continue
         if not valve.is_open:
-            # Fully closed: omit from network; results written after solve
             closed_valve_ids.add(vid)
             continue
-        try:
-            idx = pp.create_pipe_from_parameters(
-                net,
-                from_junction=j_map[valve.start_node_id],
-                to_junction=j_map[valve.end_node_id],
-                length_km=max(valve.length_m / 1000.0, 1e-6),
-                diameter_m=valve.diameter_m,
-                k_mm=0.045,
-                loss_coefficient=valve.effective_k,
-                name=valve.name,
+
+        if valve.valve_type == "orifice":
+            # Orifice: compute initial K from geometry (use last result velocity
+            # if available so the iteration starts closer to the answer)
+            v_est  = getattr(valve, "result_velocity_ms", None) or 1.0
+            d_bore = valve.bore_diameter_m or valve.diameter_m * 0.5
+            res    = compute_orifice_K(
+                d_orifice_m=d_bore,
+                d_pipe_m=valve.diameter_m,
+                rho=rho_fluid,
+                mu=1e-3,          # approximate — refined in outer iteration
+                velocity_pipe=v_est,
+                tap_type=valve.tap_type,
+                override_Cd=valve.cd_override,
+                override_K=valve.k_override,
             )
-            valve_idx_map[vid] = idx
-        except Exception as exc:
-            warnings.append(f"{vid}: could not create valve — {exc}")
+            try:
+                idx = pp.create_pipe_from_parameters(
+                    net,
+                    from_junction=j_map[valve.start_node_id],
+                    to_junction=j_map[valve.end_node_id],
+                    length_km=1e-6,
+                    diameter_m=valve.diameter_m,
+                    k_mm=0.001,
+                    loss_coefficient=max(res["K"], 0.01),
+                    name=valve.name,
+                )
+                orifice_idx_map[vid] = idx
+                # Store initial computed values
+                valve.result_cd    = res["Cd"]
+                valve.result_beta  = res["beta"]
+                valve.result_k_iso = res["K"]
+            except Exception as exc:
+                warnings.append(f"{vid}: could not create orifice — {exc}")
+        else:
+            try:
+                idx = pp.create_pipe_from_parameters(
+                    net,
+                    from_junction=j_map[valve.start_node_id],
+                    to_junction=j_map[valve.end_node_id],
+                    length_km=max(valve.length_m / 1000.0, 1e-6),
+                    diameter_m=valve.diameter_m,
+                    k_mm=0.045,
+                    loss_coefficient=valve.effective_k,
+                    name=valve.name,
+                )
+                valve_idx_map[vid] = idx
+            except Exception as exc:
+                warnings.append(f"{vid}: could not create valve — {exc}")
 
     # ── Pump elements ──────────────────────────────────────────────────────
     # Use pandapipes create_pump_from_parameters for running pumps.
     # H-Q curve points: pandapipes expects pressure_list in bar and
     # flowrate_list in m³/h.  H (m) → dp (bar) via rho*g*H/1e5.
-    try:
-        fluid_obj = pp.get_fluid(net)
-        rho_fluid  = float(fluid_obj.get_density(293.15))
-    except Exception:
-        rho_fluid = 998.2
     g = 9.81
 
     pump_idx_map:       dict[str, int]        = {}  # centrifugal ON pumps → pump table index
@@ -278,11 +322,48 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
             except Exception as exc:
                 warnings.append(f"{pump_id}: could not create pump — {exc}")
 
-    # ── Run solver ─────────────────────────────────────────────────────────
+    # ── Run solver — with outer iteration for orifice Cd(Re) ──────────────
     try:
         pp.pipeflow(net, iter=1000, tol_p=1e-3, tol_v=1e-3, verbose=False)
     except Exception as exc:
         raise SolverError(f"Solver did not converge: {exc}")
+
+    # ── Orifice outer iteration: update K based on actual Re ──────────────
+    if orifice_idx_map:
+        for _outer in range(10):
+            K_changed = False
+            for vid, pidx in orifice_idx_map.items():
+                valve  = model.valves[vid]
+                d_bore = valve.bore_diameter_m or valve.diameter_m * 0.5
+                try:
+                    v_new = float(net.res_pipe.loc[pidx, "v_mean_m_per_s"])
+                except Exception:
+                    continue
+                res = compute_orifice_K(
+                    d_orifice_m=d_bore,
+                    d_pipe_m=valve.diameter_m,
+                    rho=rho_fluid,
+                    mu=mu_fluid,
+                    velocity_pipe=v_new if abs(v_new) > 1e-6 else 1e-4,
+                    tap_type=valve.tap_type,
+                    override_Cd=valve.cd_override,
+                    override_K=valve.k_override,
+                )
+                K_new = max(res["K"], 0.01)
+                K_old = float(net.pipe.loc[pidx, "loss_coefficient"])
+                if abs(K_new - K_old) > 1e-3 * max(K_old, 1.0) + 1e-4:
+                    net.pipe.loc[pidx, "loss_coefficient"] = K_new
+                    K_changed = True
+                # Update stored orifice results
+                valve.result_cd    = res["Cd"]
+                valve.result_beta  = res["beta"]
+                valve.result_k_iso = res["K"]
+            if not K_changed:
+                break
+            try:
+                pp.pipeflow(net, iter=1000, tol_p=1e-3, tol_v=1e-3, verbose=False)
+            except Exception as exc:
+                raise SolverError(f"Orifice outer iteration failed: {exc}")
 
     # ── Extract junction pressure results ──────────────────────────────────
     for nid, node in model.nodes.items():
@@ -294,9 +375,10 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
         except Exception:
             node.result_pressure_bar = None
 
-    # ── Extract pipe/valve results ─────────────────────────────────────────
+    # ── Extract pipe/valve/orifice results ────────────────────────────────
     _extract_pipe_results(net, model.pipes, pipe_idx_map, rho_fluid)
     _extract_pipe_results(net, model.valves, valve_idx_map, rho_fluid)
+    _extract_pipe_results(net, model.valves, orifice_idx_map, rho_fluid)
     _extract_pipe_results(net, model.pumps, pump_pipe_map, rho_fluid)  # OFF pumps
 
     # ── Write CLOSED valve results (zero flow; pressures from junctions) ───
@@ -497,9 +579,18 @@ def _solve_fallback(model: NetworkModel, warnings: list[str]) -> None:
     dp_boundary = (source.pressure_bar - sink.pressure_bar) * 1e5
 
     def _colebrook_friction(re: float, eps_d: float) -> float:
-        """Swamee-Jain approximation to Colebrook-White equation."""
+        """
+        Darcy friction factor.
+        Uses fluids.friction_factor (Clamond method) when available,
+        otherwise falls back to Swamee-Jain approximation.
+        """
         if re < 2300.0:
             return 64.0 / max(re, 1.0)
+        if _FLUIDS:
+            try:
+                return float(_fluids.friction_factor(Re=re, eD=eps_d))
+            except Exception:
+                pass
         denom = math.log10(eps_d / 3.7 + 5.74 / re ** 0.9) ** 2
         return 0.25 / denom if denom != 0 else 0.02
 
@@ -520,7 +611,26 @@ def _solve_fallback(model: NetworkModel, warnings: list[str]) -> None:
         elif isinstance(branch, ValveData):
             d = branch.diameter_m
             A = math.pi * d**2 / 4.0 if d > 0 else 1e-6
-            K = branch.effective_k
+            if branch.valve_type == "orifice":
+                # Compute orifice K from geometry at current Q_guess velocity
+                v_est  = Q_guess / A if A > 0 else 1e-4
+                d_bore = branch.bore_diameter_m or d * 0.5
+                from app.physics.fluid_library import get_fluid_display
+                fdata  = get_fluid_display(model.fluid_name)
+                mu_est = fdata.get("viscosity_pa_s", 1e-3)
+                res = compute_orifice_K(
+                    d_orifice_m=d_bore, d_pipe_m=d,
+                    rho=rho, mu=mu_est, velocity_pipe=v_est,
+                    tap_type=branch.tap_type,
+                    override_Cd=branch.cd_override,
+                    override_K=branch.k_override,
+                )
+                K = max(res["K"], 0.01)
+                branch.result_cd   = res["Cd"]
+                branch.result_beta = res["beta"]
+                branch.result_k_iso = res["K"]
+            else:
+                K = branch.effective_k
             R = K * rho / (2.0 * A**2) if A > 0 else 1e12
             return d, 0.0, 0.0, A, R
 
