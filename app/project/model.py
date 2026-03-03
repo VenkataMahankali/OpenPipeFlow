@@ -146,17 +146,25 @@ class ValveData:
 
 @dataclass
 class PumpData:
-    """Data for a centrifugal pump."""
+    """Data for a pump (centrifugal or fixed-displacement)."""
     id: str
     name: str
     start_node_id: str
     end_node_id: str
 
-    # Head-flow curve: list of (Q_m3s, H_m) tuples
+    # Pump type
+    pump_type: str = "centrifugal"   # "centrifugal" | "fixed_displacement"
+
+    # Head-flow curve: list of (Q_m3s, H_m) tuples — used for centrifugal
     curve_points: list = field(default_factory=lambda: [
         (0.0, 30.0), (0.01, 28.0), (0.02, 24.0),
         (0.03, 18.0), (0.04, 10.0), (0.05, 0.0)
     ])
+
+    # Fixed-displacement parameters (used when pump_type == "fixed_displacement")
+    fixed_flow_m3s: float = 0.005   # setpoint volumetric flow (m³/s)
+    fixed_head_m:   float = 50.0    # max head for synthetic H-Q curve (m)
+
     speed_rpm: float = 1450.0
     diameter_m: float = 0.1
     length_m: float = 0.5

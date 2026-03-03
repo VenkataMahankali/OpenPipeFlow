@@ -5,10 +5,11 @@ source, sink, or measurement node on the canvas.
 
 from __future__ import annotations
 import math
-from PyQt6.QtWidgets import QGraphicsItem
-from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.QtWidgets import QGraphicsItem, QMenu
+from PyQt6.QtCore import Qt, QRectF, QPointF, QTimer
 from PyQt6.QtGui import (QPainter, QPen, QBrush, QColor,
                           QPainterPath, QRadialGradient)
+from app.utils.units import UNITS
 
 from app.canvas.items.base_item import BaseItem
 from app.utils.constants import NODE_RADIUS_PX, MEAS_NODE_RADIUS_PX
@@ -76,6 +77,23 @@ class NodeItem(BaseItem):
         self._result_pressure_bar = pressure_bar
         self.update()
 
+    # ── Context menu ──────────────────────────────────────────────────────
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        menu.addAction("Properties",
+                       lambda: self.double_clicked.emit(self._element_id))
+        menu.addSeparator()
+        act_del = menu.addAction("Delete")
+        chosen = menu.exec(event.screenPos())
+        if chosen == act_del:
+            sc = self.scene()
+            if sc:
+                sc.clearSelection()
+                self.setSelected(True)
+                QTimer.singleShot(0, sc.delete_selected)
+        event.accept()
+
     # ── itemChange: propagate position to connected pipes ─────────────────
 
     def itemChange(self, change, value):
@@ -125,7 +143,9 @@ class NodeItem(BaseItem):
 
         # ── Pressure result above node ─────────────────────────────────────
         if self._result_pressure_bar is not None:
-            val_str = f"{self._result_pressure_bar:.3f} bar"
+            from app.utils.units import PRESSURE_DECIMALS
+            dec = PRESSURE_DECIMALS[UNITS.pressure]
+            val_str = f"{UNITS.p(self._result_pressure_bar):.{dec}f} {UNITS.pressure}"
             self._paint_label(painter, val_str, 0, -(r + 16), align_center=True)
 
     def _draw_circle(self, painter: QPainter, r: float, colour: QColor):

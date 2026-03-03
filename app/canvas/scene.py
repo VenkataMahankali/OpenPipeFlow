@@ -7,6 +7,7 @@ timer for animated flow arrows.
 """
 
 from __future__ import annotations
+import copy
 import time
 from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsItem, QRubberBand,
@@ -17,7 +18,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QTransform, QWheelEvent,
-    QMouseEvent, QKeyEvent, QCursor
+    QMouseEvent, QKeyEvent, QCursor, QUndoCommand
 )
 
 from app.canvas.items.node_item  import NodeItem
@@ -30,6 +31,33 @@ from app.utils.constants import (
 )
 from app.utils.styles import COLOR
 import app.project.id_generator as id_gen
+
+
+# ---------------------------------------------------------------------------
+# Undo command for deletion
+# ---------------------------------------------------------------------------
+
+class _DeleteCmd(QUndoCommand):
+    """Undoable deletion of nodes and branches."""
+
+    def __init__(self, scene, model, node_snaps, branch_snaps, node_ids, branch_ids):
+        super().__init__("Delete")
+        self._scene        = scene
+        self._model        = model
+        self._node_snaps   = node_snaps    # deep-copied NodeData list
+        self._branch_snaps = branch_snaps  # deep-copied PipeData/ValveData/PumpData list
+        self._node_ids     = node_ids
+        self._branch_ids   = branch_ids
+
+    def redo(self):
+        self._scene._do_delete(self._node_ids, self._branch_ids)
+
+    def undo(self):
+        for nd in self._node_snaps:
+            self._scene._restore_node(nd)
+        for bd in self._branch_snaps:
+            self._scene._restore_branch(bd)
+        self._scene.network_changed.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -328,37 +356,115 @@ class PipeNetworkScene(QGraphicsScene):
 
         self.network_changed.emit()
 
-    # ── Deletion ──────────────────────────────────────────────────────────
+    # ── Deletion (with undo support) ──────────────────────────────────────
 
     def delete_selected(self):
+        """Delete selected items, pushing an undoable command to the undo stack."""
         selected = list(self.selectedItems())
-        # Collect IDs to delete before removing anything
-        node_ids  = [getattr(i, 'element_id', None)
-                     for i in selected if isinstance(i, NodeItem)]
+        node_ids = [getattr(i, 'element_id', None)
+                    for i in selected if isinstance(i, NodeItem)]
         branch_ids = [getattr(i, 'element_id', None)
                       for i in selected
                       if isinstance(i, PipeItem) and not isinstance(i, NodeItem)]
+        node_ids   = [id_ for id_ in node_ids   if id_]
+        branch_ids = [id_ for id_ in branch_ids if id_]
 
-        # Remove branches first (avoids dangling refs)
+        if not node_ids and not branch_ids:
+            return
+
+        # Build deep-copy snapshots BEFORE deleting anything
+        node_snaps = []
+        branch_snap_ids = set(branch_ids)
+
+        for nid in node_ids:
+            nd = self._model.nodes.get(nid)
+            if nd:
+                node_snaps.append(copy.deepcopy(nd))
+                # Also snapshot all branches connected to this node
+                node_item = self._item_by_id.get(nid)
+                if isinstance(node_item, NodeItem):
+                    for pipe_item in node_item.connected_pipes:
+                        pid = getattr(pipe_item, 'element_id', None)
+                        if pid:
+                            branch_snap_ids.add(pid)
+
+        branch_snaps = []
+        for bid in branch_snap_ids:
+            bd = (self._model.pipes.get(bid)
+                  or self._model.valves.get(bid)
+                  or self._model.pumps.get(bid))
+            if bd:
+                branch_snaps.append(copy.deepcopy(bd))
+
+        cmd = _DeleteCmd(self, self._model, node_snaps, branch_snaps,
+                         node_ids, list(branch_snap_ids))
+        self.undo_stack.push(cmd)   # push calls cmd.redo() immediately
+
+    def _do_delete(self, node_ids, branch_ids):
+        """Internal: physically remove nodes and branches from scene + model."""
         for eid in branch_ids:
-            if eid and eid in self._item_by_id:
+            if eid in self._item_by_id:
                 self._remove_branch_item_by_id(eid)
 
-        # Remove nodes (and their connected branches)
         for eid in node_ids:
-            if eid and eid in self._item_by_id:
-                node_item = self._item_by_id[eid]
-                if isinstance(node_item, NodeItem):
-                    for pipe in list(node_item.connected_pipes):
-                        pid = getattr(pipe, 'element_id', None)
-                        if pid and pid in self._item_by_id:
-                            self._remove_branch_item_by_id(pid)
+            if eid not in self._item_by_id:
+                continue
+            node_item = self._item_by_id[eid]
+            if isinstance(node_item, NodeItem):
+                for pipe in list(node_item.connected_pipes):
+                    pid = getattr(pipe, 'element_id', None)
+                    if pid and pid in self._item_by_id:
+                        self._remove_branch_item_by_id(pid)
                 self._model.remove_node(eid)
                 self._item_by_id.pop(eid, None)
                 if node_item.scene() is self:
                     self.removeItem(node_item)
 
         self.network_changed.emit()
+
+    def _restore_node(self, node_data):
+        """Re-add a node to the scene and model from a deep-copied snapshot."""
+        self._model.nodes[node_data.id] = node_data
+        item = NodeItem(node_data.id, node_data.name, node_data.node_type)
+        item.setPos(QPointF(node_data.x, node_data.y))
+        item.double_clicked.connect(self.element_double_clicked)
+        item.position_changed.connect(self._on_item_moved)
+        self.addItem(item)
+        self._item_by_id[node_data.id] = item
+
+    def _restore_branch(self, branch_data):
+        """Re-add a branch to the scene and model from a deep-copied snapshot."""
+        from app.project.model import PipeData, ValveData, PumpData
+
+        if isinstance(branch_data, PipeData):
+            self._model.pipes[branch_data.id] = branch_data
+            ItemClass = PipeItem
+        elif isinstance(branch_data, ValveData):
+            self._model.valves[branch_data.id] = branch_data
+            ItemClass = ValveItem
+        elif isinstance(branch_data, PumpData):
+            self._model.pumps[branch_data.id] = branch_data
+            ItemClass = PumpItem
+        else:
+            return
+
+        s_item = self._item_by_id.get(branch_data.start_node_id)
+        e_item = self._item_by_id.get(branch_data.end_node_id)
+        if not isinstance(s_item, NodeItem) or not isinstance(e_item, NodeItem):
+            return
+
+        item = ItemClass(branch_data.id, branch_data.name, s_item, e_item)
+        if isinstance(branch_data, ValveData):
+            item.valve_type = branch_data.valve_type
+            item.open_pct   = branch_data.open_pct
+        elif isinstance(branch_data, PumpData):
+            item.on_off = branch_data.on_off
+
+        item.double_clicked.connect(self.element_double_clicked)
+        self.addItem(item)
+        self._item_by_id[branch_data.id] = item
+        s_item.add_pipe(item)
+        e_item.add_pipe(item)
 
     def _remove_branch_item(self, item: PipeItem):
         """Remove a branch item by reference (used by node deletion)."""

@@ -5,7 +5,9 @@ Sections per element type:
   Node     — tag, elevation, pressure (source/sink), alarm thresholds
   Pipe     — tag, DN/schedule preset, diameter, length, roughness, material, K
   Valve    — tag, type, Cv/Kv, K-factor, open%, diameter, bore (orifice), Cd
-  Pump     — tag, on/off, speed, diameter, editable H-Q curve table
+  Pump     — tag, type (centrifugal/fixed-displacement), on/off, curve/flow
+
+All physical values are displayed in the user's chosen unit system via UNITS.
 """
 
 from __future__ import annotations
@@ -15,11 +17,17 @@ from PyQt6.QtWidgets import (
     QPushButton, QScrollArea, QSpinBox, QTableWidget,
     QTableWidgetItem, QSizePolicy, QFrame, QHeaderView
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from app.project.model import (
     NetworkModel, NodeData, PipeData, ValveData, PumpData
+)
+from app.utils.units import (
+    UNITS,
+    PRESSURE_DECIMALS, FLOW_DECIMALS, LENGTH_DECIMALS, VELOCITY_DECIMALS,
+    PRESSURE_RESULT_DEC, FLOW_RESULT_DEC,
+    PRESSURE_STEP, FLOW_STEP, LENGTH_STEP, VELOCITY_STEP,
 )
 
 # ---------------------------------------------------------------------------
@@ -45,7 +53,7 @@ DN_PRESETS: dict[str, float] = {
     "DN 500 (20\")": 0.49022,
 }
 
-# Material roughness presets (mm)
+# Material roughness presets (mm) — roughness is always shown in mm
 MATERIAL_ROUGHNESS: dict[str, float] = {
     "Steel (commercial)":    0.045,
     "Steel (drawn)":         0.015,
@@ -70,6 +78,21 @@ VALVE_K_DEFAULTS: dict[str, float] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# _NoScrollSpinBox — QDoubleSpinBox that never steals scroll events
+# ---------------------------------------------------------------------------
+
+class _NoScrollSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that ignores scroll wheel and selects all on focus."""
+
+    def wheelEvent(self, event):
+        event.ignore()  # Don't change value on scroll
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        QTimer.singleShot(0, self.selectAll)  # Select all text on click
+
+
 class _SectionHeader(QLabel):
     def __init__(self, text, parent=None):
         super().__init__(text.upper(), parent)
@@ -78,6 +101,10 @@ class _SectionHeader(QLabel):
             " letter-spacing: 1px; padding: 5px 0 2px 0;"
         )
 
+
+# ---------------------------------------------------------------------------
+# PropertiesPanel
+# ---------------------------------------------------------------------------
 
 class PropertiesPanel(QWidget):
     """Shows editable properties for the selected element."""
@@ -142,6 +169,11 @@ class PropertiesPanel(QWidget):
         if self._current_id:
             self.show_element(self._current_id)
 
+    def refresh(self):
+        """Redisplay the current element — called when units change."""
+        if self._current_id:
+            self.show_element(self._current_id)
+
     # ── Clear ──────────────────────────────────────────────────────────────
 
     def _clear_content(self):
@@ -169,8 +201,10 @@ class PropertiesPanel(QWidget):
         name_e = QLineEdit(node.name)
         name_e.textChanged.connect(lambda t: self._update_node(node, name=t))
         fl.addRow("Tag / Name:", name_e)
-        elev = self._dspin(-1000, 10000, node.elevation_m, "m")
-        elev.valueChanged.connect(lambda v: self._update_node(node, elevation_m=v))
+
+        elev = self._elev_spin(node.elevation_m)
+        elev.valueChanged.connect(
+            lambda v: self._update_node(node, elevation_m=UNITS.l_to_si(v)))
         fl.addRow("Elevation:", elev)
         self._insert(grp)
 
@@ -178,8 +212,9 @@ class PropertiesPanel(QWidget):
             grp2 = self._group("Boundary Condition")
             fl2 = QFormLayout(grp2)
             fl2.setSpacing(5)
-            p = self._dspin(0, 1000, node.pressure_bar, "bar", 3)
-            p.valueChanged.connect(lambda v: self._update_node(node, pressure_bar=v))
+            p = self._p_spin(node.pressure_bar)
+            p.valueChanged.connect(
+                lambda v: self._update_node(node, pressure_bar=UNITS.p_to_si(v)))
             fl2.addRow("Fixed pressure:", p)
             self._insert(grp2)
 
@@ -187,20 +222,22 @@ class PropertiesPanel(QWidget):
         grp3 = self._group("Alarm Thresholds")
         fl3 = QFormLayout(grp3)
         fl3.setSpacing(5)
-        mn = self._dspin(0, 1000, node.alarm_min_pressure_bar or 0.0, "bar", 3)
+        mn = self._p_spin(node.alarm_min_pressure_bar or 0.0)
         mn.valueChanged.connect(
-            lambda v: self._update_node(node, alarm_min_pressure_bar=None if v == 0 else v))
+            lambda v: self._update_node(
+                node, alarm_min_pressure_bar=None if v == 0 else UNITS.p_to_si(v)))
         fl3.addRow("Min pressure:", mn)
-        mx = self._dspin(0, 1000, node.alarm_max_pressure_bar or 0.0, "bar", 3)
+        mx = self._p_spin(node.alarm_max_pressure_bar or 0.0)
         mx.valueChanged.connect(
-            lambda v: self._update_node(node, alarm_max_pressure_bar=None if v == 0 else v))
+            lambda v: self._update_node(
+                node, alarm_max_pressure_bar=None if v == 0 else UNITS.p_to_si(v)))
         fl3.addRow("Max pressure:", mx)
         self._insert(grp3)
 
         if node.result_pressure_bar is not None:
             rg = self._result_group()
             rl = QFormLayout(rg)
-            rl.addRow("Pressure:", self._result_lbl(f"{node.result_pressure_bar:.4f} bar"))
+            rl.addRow("Pressure:", self._result_lbl(self._fmt_p(node.result_pressure_bar)))
             self._insert(rg)
 
         self._content_layout.addStretch()
@@ -224,38 +261,37 @@ class PropertiesPanel(QWidget):
         fl2 = QFormLayout(grp2)
         fl2.setSpacing(5)
 
-        # DN preset selector
         dn_box = QComboBox()
         dn_box.addItems(list(DN_PRESETS.keys()))
-        # Select "Custom" initially
         dn_box.setCurrentIndex(0)
         fl2.addRow("DN / NPS:", dn_box)
 
-        diam_spin = self._dspin(0.001, 5.0, pipe.diameter_m, "m", 4)
+        diam_spin = self._l_spin(pipe.diameter_m)
         fl2.addRow("Inner diameter:", diam_spin)
 
         def _on_dn_selected(txt):
             d = DN_PRESETS.get(txt, 0.0)
             if d > 0:
                 self._suppress_signals = True
-                diam_spin.setValue(d)
+                diam_spin.setValue(UNITS.l(d))
                 self._suppress_signals = False
                 self._update_pipe(pipe, diameter_m=d)
 
         def _on_diam_changed(v):
             if not self._suppress_signals:
-                self._update_pipe(pipe, diameter_m=v)
+                self._update_pipe(pipe, diameter_m=UNITS.l_to_si(v))
 
         dn_box.currentTextChanged.connect(_on_dn_selected)
         diam_spin.valueChanged.connect(_on_diam_changed)
 
-        length = self._dspin(0.01, 100000, pipe.length_m, "m", 2)
-        length.valueChanged.connect(lambda v: self._update_pipe(pipe, length_m=v))
+        length = self._plen_spin(pipe.length_m)
+        length.valueChanged.connect(
+            lambda v: self._update_pipe(pipe, length_m=UNITS.l_to_si(v)))
         fl2.addRow("Length:", length)
 
         self._insert(grp2)
 
-        # Material / roughness
+        # Material / roughness (roughness always in mm)
         grp3 = self._group("Material & Roughness")
         fl3 = QFormLayout(grp3)
         fl3.setSpacing(5)
@@ -263,7 +299,6 @@ class PropertiesPanel(QWidget):
         mat_box = QComboBox()
         mat_box.addItems(list(MATERIAL_ROUGHNESS.keys()))
         mat_box.setEditable(True)
-        # Try to match current material
         if pipe.material in MATERIAL_ROUGHNESS:
             mat_box.setCurrentText(pipe.material)
         fl3.addRow("Material:", mat_box)
@@ -298,14 +333,12 @@ class PropertiesPanel(QWidget):
         if pipe.result_velocity_ms is not None:
             rg = self._result_group()
             rl = QFormLayout(rg)
-            rl.addRow("Velocity:",    self._result_lbl(f"{pipe.result_velocity_ms:.3f} m/s"))
+            rl.addRow("Velocity:",    self._result_lbl(self._fmt_v(pipe.result_velocity_ms)))
             if pipe.result_flow_m3s is not None:
-                lpm = pipe.result_flow_m3s * 60000
-                rl.addRow("Flow rate:",  self._result_lbl(
-                    f"{pipe.result_flow_m3s:.5f} m³/s  ({lpm:.1f} L/min)"))
+                rl.addRow("Flow rate:",  self._result_lbl(self._fmt_q(pipe.result_flow_m3s)))
             if pipe.result_delta_p_bar is not None:
                 rl.addRow("Pressure drop:", self._result_lbl(
-                    f"{pipe.result_delta_p_bar:.4f} bar"))
+                    self._fmt_p(pipe.result_delta_p_bar)))
             if pipe.result_reynolds is not None:
                 rl.addRow("Reynolds:",  self._result_lbl(
                     f"{pipe.result_reynolds:.0f}  ({pipe.result_regime})"))
@@ -338,22 +371,22 @@ class PropertiesPanel(QWidget):
         fl2 = QFormLayout(grp2)
         fl2.setSpacing(5)
 
-        diam_spin = self._dspin(0.001, 5.0, valve.diameter_m, "m", 4)
-        diam_spin.valueChanged.connect(lambda v: self._update_valve(valve, diameter_m=v))
+        diam_spin = self._l_spin(valve.diameter_m)
+        diam_spin.valueChanged.connect(
+            lambda v: self._update_valve(valve, diameter_m=UNITS.l_to_si(v)))
         fl2.addRow("Line diameter:", diam_spin)
 
         if is_orifice:
             bore = valve.bore_diameter_m or valve.diameter_m * 0.5
-            bore_spin = self._dspin(0.001, 5.0, bore, "m", 4)
+            bore_spin = self._l_spin(bore)
             bore_spin.valueChanged.connect(
-                lambda v: self._update_valve(valve, bore_diameter_m=v))
+                lambda v: self._update_valve(valve, bore_diameter_m=UNITS.l_to_si(v)))
             fl2.addRow("Bore diameter:", bore_spin)
 
             cd_spin = self._dspin(0.1, 1.0, valve.cd, "", 3)
             cd_spin.valueChanged.connect(lambda v: self._update_valve(valve, cd=v))
             fl2.addRow("Cd (discharge):", cd_spin)
 
-            # Show computed beta and K
             if valve.bore_diameter_m and valve.diameter_m:
                 beta = valve.bore_diameter_m / valve.diameter_m
                 fl2.addRow("Beta ratio (d/D):", self._result_lbl(f"{beta:.3f}"))
@@ -366,7 +399,6 @@ class PropertiesPanel(QWidget):
             kf_spin.valueChanged.connect(lambda v: self._update_valve(valve, k_factor=v))
             fl2.addRow("K-factor (fully open):", kf_spin)
 
-            # Cv / Kv display  (Cv in US gpm/psi^0.5; Kv = Cv × 0.8647)
             if valve.cv_usgpm is not None:
                 fl2.addRow("Cv:", self._result_lbl(f"{valve.cv_usgpm:.1f} USgpm/psi½"))
                 kv = valve.cv_usgpm * 0.8647
@@ -386,14 +418,12 @@ class PropertiesPanel(QWidget):
         if valve.result_velocity_ms is not None:
             rg = self._result_group()
             rl = QFormLayout(rg)
-            rl.addRow("Velocity:",     self._result_lbl(f"{valve.result_velocity_ms:.3f} m/s"))
+            rl.addRow("Velocity:",     self._result_lbl(self._fmt_v(valve.result_velocity_ms)))
             if valve.result_flow_m3s is not None:
-                lpm = valve.result_flow_m3s * 60000
-                rl.addRow("Flow rate:",    self._result_lbl(
-                    f"{valve.result_flow_m3s:.5f} m³/s  ({lpm:.1f} L/min)"))
+                rl.addRow("Flow rate:",    self._result_lbl(self._fmt_q(valve.result_flow_m3s)))
             if valve.result_delta_p_bar is not None:
                 rl.addRow("Pressure drop:", self._result_lbl(
-                    f"{valve.result_delta_p_bar:.4f} bar"))
+                    self._fmt_p(valve.result_delta_p_bar)))
             if valve.result_reynolds is not None:
                 rl.addRow("Reynolds:",     self._result_lbl(
                     f"{valve.result_reynolds:.0f}  ({valve.result_regime})"))
@@ -403,26 +433,38 @@ class PropertiesPanel(QWidget):
 
     def _on_valve_type_changed(self, valve: ValveData, new_type: str):
         valve.valve_type = new_type
-        # Apply a sensible default K for the new type
         default_k = VALVE_K_DEFAULTS.get(new_type, valve.k_factor)
         valve.k_factor = default_k
         self.properties_changed.emit(valve.id)
-        # Rebuild form so orifice-specific fields appear/disappear
         self.show_element(valve.id)
 
     # ── Pump editor ────────────────────────────────────────────────────────
 
     def _show_pump(self, pump: PumpData):
-        self._title_label.setText(f"Centrifugal Pump  |  {pump.id}")
+        type_label = {
+            "centrifugal":       "Centrifugal Pump",
+            "fixed_displacement":"Fixed Displacement Pump",
+        }.get(pump.pump_type, "Pump")
+        self._title_label.setText(f"{type_label}  |  {pump.id}")
 
+        # Identification + type
         grp1 = self._group("Identification")
         fl1 = QFormLayout(grp1)
         fl1.setSpacing(5)
         name_e = QLineEdit(pump.name)
         name_e.textChanged.connect(lambda t: self._update_pump(pump, name=t))
         fl1.addRow("Tag / Name:", name_e)
+
+        ptype_box = QComboBox()
+        ptype_box.addItems(["Centrifugal (H-Q curve)", "Fixed Displacement"])
+        ptype_box.setCurrentIndex(0 if pump.pump_type == "centrifugal" else 1)
+        ptype_box.currentIndexChanged.connect(
+            lambda i: self._on_pump_type_changed(
+                pump, "centrifugal" if i == 0 else "fixed_displacement"))
+        fl1.addRow("Pump type:", ptype_box)
         self._insert(grp1)
 
+        # Operating state
         grp2 = self._group("Operating State")
         fl2 = QFormLayout(grp2)
         fl2.setSpacing(5)
@@ -433,37 +475,68 @@ class PropertiesPanel(QWidget):
         rpm = self._dspin(0, 10000, pump.speed_rpm, "RPM", 0)
         rpm.valueChanged.connect(lambda v: self._update_pump(pump, speed_rpm=v))
         fl2.addRow("Speed:", rpm)
-        diam = self._dspin(0.001, 5.0, pump.diameter_m, "m", 4)
-        diam.valueChanged.connect(lambda v: self._update_pump(pump, diameter_m=v))
+        diam = self._l_spin(pump.diameter_m)
+        diam.valueChanged.connect(
+            lambda v: self._update_pump(pump, diameter_m=UNITS.l_to_si(v)))
         fl2.addRow("Nozzle diameter:", diam)
         self._insert(grp2)
 
-        # H-Q curve table (editable)
+        if pump.pump_type == "centrifugal":
+            self._show_pump_hq_curve(pump)
+        else:
+            self._show_pump_fixed_displacement(pump)
+
+        # Results
+        if pump.result_flow_m3s is not None:
+            rg = self._result_group()
+            rl = QFormLayout(rg)
+            rl.addRow("Flow rate:", self._result_lbl(self._fmt_q(pump.result_flow_m3s)))
+            if pump.result_velocity_ms is not None:
+                rl.addRow("Velocity:", self._result_lbl(self._fmt_v(pump.result_velocity_ms)))
+            if pump.result_head_m is not None:
+                dec = LENGTH_DECIMALS[UNITS.length]
+                rl.addRow("Head delivered:", self._result_lbl(
+                    f"{UNITS.l(pump.result_head_m):.{dec}f} {UNITS.length}"))
+            if pump.result_p_from_bar is not None and pump.result_p_to_bar is not None:
+                dp = pump.result_p_to_bar - pump.result_p_from_bar
+                dec = PRESSURE_RESULT_DEC[UNITS.pressure]
+                rl.addRow("Pressure gain:", self._result_lbl(
+                    f"{UNITS.p(dp):+.{dec}f} {UNITS.pressure}"))
+            self._insert(rg)
+
+        self._content_layout.addStretch()
+
+    def _show_pump_hq_curve(self, pump: PumpData):
+        """Build the H-Q curve table section (centrifugal pumps)."""
         grp3 = self._group("Head-Flow Curve")
         v3 = QVBoxLayout(grp3)
         v3.setSpacing(3)
-        note = QLabel("Flow (m³/s) vs Head (m) — edit cells then press Enter")
+        note = QLabel(
+            f"Q ({UNITS.flow}) vs H ({UNITS.length}) — edit cells then press Enter")
         note.setStyleSheet("color: #7f8fa6; font-size: 9px;")
         note.setWordWrap(True)
         v3.addWidget(note)
 
+        dec_q = FLOW_DECIMALS[UNITS.flow]
+        dec_h = LENGTH_DECIMALS[UNITS.length]
+
         tbl = QTableWidget(len(pump.curve_points), 2)
-        tbl.setHorizontalHeaderLabels(["Q (m³/s)", "H (m)"])
+        tbl.setHorizontalHeaderLabels([f"Q ({UNITS.flow})", f"H ({UNITS.length})"])
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         tbl.verticalHeader().setVisible(False)
         tbl.setMaximumHeight(180)
         tbl.setMinimumHeight(80)
         for row, (q, h) in enumerate(pump.curve_points):
-            tbl.setItem(row, 0, QTableWidgetItem(f"{q:.4f}"))
-            tbl.setItem(row, 1, QTableWidgetItem(f"{h:.2f}"))
+            tbl.setItem(row, 0, QTableWidgetItem(f"{UNITS.q(q):.{dec_q}f}"))
+            tbl.setItem(row, 1, QTableWidgetItem(f"{UNITS.l(h):.{dec_h}f}"))
 
         def _curve_edited():
             pts = []
             for r in range(tbl.rowCount()):
                 try:
-                    q = float(tbl.item(r, 0).text())
-                    h = float(tbl.item(r, 1).text())
-                    pts.append((q, h))
+                    q_disp = float(tbl.item(r, 0).text())
+                    h_disp = float(tbl.item(r, 1).text())
+                    pts.append((UNITS.q_to_si(q_disp), UNITS.l_to_si(h_disp)))
                 except (ValueError, AttributeError):
                     pass
             pump.curve_points = sorted(pts, key=lambda p: p[0])
@@ -472,7 +545,6 @@ class PropertiesPanel(QWidget):
         tbl.cellChanged.connect(lambda *_: _curve_edited())
         v3.addWidget(tbl)
 
-        # Add / remove row buttons
         btn_row = QWidget()
         bh = QHBoxLayout(btn_row)
         bh.setContentsMargins(0, 0, 0, 0)
@@ -505,26 +577,34 @@ class PropertiesPanel(QWidget):
         v3.addWidget(btn_row)
         self._insert(grp3)
 
-        # Results
-        if pump.result_flow_m3s is not None:
-            rg = self._result_group()
-            rl = QFormLayout(rg)
-            lpm = pump.result_flow_m3s * 60000
-            rl.addRow("Flow rate:", self._result_lbl(
-                f"{pump.result_flow_m3s:.5f} m³/s  ({lpm:.1f} L/min)"))
-            if pump.result_velocity_ms is not None:
-                rl.addRow("Velocity:", self._result_lbl(
-                    f"{pump.result_velocity_ms:.3f} m/s"))
-            if pump.result_head_m is not None:
-                rl.addRow("Head delivered:", self._result_lbl(
-                    f"{pump.result_head_m:.2f} m"))
-            if pump.result_p_from_bar is not None and pump.result_p_to_bar is not None:
-                dp = pump.result_p_to_bar - pump.result_p_from_bar
-                rl.addRow("Pressure gain:", self._result_lbl(
-                    f"{dp:+.4f} bar"))
-            self._insert(rg)
+    def _show_pump_fixed_displacement(self, pump: PumpData):
+        """Build the fixed-flow section (fixed-displacement pumps)."""
+        grp3 = self._group("Fixed Displacement Settings")
+        fl3 = QFormLayout(grp3)
+        fl3.setSpacing(5)
 
-        self._content_layout.addStretch()
+        note = QLabel(
+            "Delivers a constant flow regardless of system pressure.")
+        note.setStyleSheet("color: #7f8fa6; font-size: 9px;")
+        note.setWordWrap(True)
+        fl3.addRow(note)
+
+        q_spin = self._q_spin(pump.fixed_flow_m3s)
+        q_spin.valueChanged.connect(
+            lambda v: self._update_pump(pump, fixed_flow_m3s=UNITS.q_to_si(v)))
+        fl3.addRow("Fixed flow rate:", q_spin)
+
+        h_spin = self._head_spin(pump.fixed_head_m)
+        h_spin.valueChanged.connect(
+            lambda v: self._update_pump(pump, fixed_head_m=UNITS.l_to_si(v)))
+        fl3.addRow("Max head:", h_spin)
+
+        self._insert(grp3)
+
+    def _on_pump_type_changed(self, pump: PumpData, new_type: str):
+        pump.pump_type = new_type
+        self.properties_changed.emit(pump.id)
+        self.show_element(pump.id)
 
     # ── Model update helpers ───────────────────────────────────────────────
 
@@ -548,7 +628,101 @@ class PropertiesPanel(QWidget):
             setattr(pump, k, v)
         self.properties_changed.emit(pump.id)
 
-    # ── Widget factories ───────────────────────────────────────────────────
+    # ── Unit-aware spinbox factories ───────────────────────────────────────
+
+    def _p_spin(self, si_bar) -> _NoScrollSpinBox:
+        """Pressure spinbox in user's pressure unit."""
+        sp = _NoScrollSpinBox()
+        lo = 0.0
+        hi = UNITS.p(1000.0)   # 1000 bar in display unit
+        sp.setRange(lo, hi)
+        sp.setDecimals(PRESSURE_DECIMALS[UNITS.pressure])
+        sp.setSuffix(f" {UNITS.pressure}")
+        sp.setValue(UNITS.p(float(si_bar) if si_bar is not None else 0.0))
+        sp.setSingleStep(PRESSURE_STEP[UNITS.pressure])
+        return sp
+
+    def _l_spin(self, si_m, lo_m=0.001, hi_m=5.0) -> _NoScrollSpinBox:
+        """Length/diameter spinbox in user's length unit."""
+        f = UNITS.l_factor()
+        sp = _NoScrollSpinBox()
+        sp.setRange(lo_m * f, hi_m * f)
+        sp.setDecimals(LENGTH_DECIMALS[UNITS.length])
+        sp.setSuffix(f" {UNITS.length}")
+        sp.setValue(UNITS.l(float(si_m) if si_m is not None else 0.0))
+        sp.setSingleStep(LENGTH_STEP[UNITS.length])
+        return sp
+
+    def _plen_spin(self, si_m) -> _NoScrollSpinBox:
+        """Pipe length spinbox (larger range than diameter)."""
+        return self._l_spin(si_m, lo_m=0.01, hi_m=100_000.0)
+
+    def _elev_spin(self, si_m) -> _NoScrollSpinBox:
+        """Elevation spinbox (allows negative values)."""
+        f = UNITS.l_factor()
+        sp = _NoScrollSpinBox()
+        sp.setRange(-1000.0 * f, 10_000.0 * f)
+        sp.setDecimals(LENGTH_DECIMALS[UNITS.length])
+        sp.setSuffix(f" {UNITS.length}")
+        sp.setValue(UNITS.l(float(si_m) if si_m is not None else 0.0))
+        sp.setSingleStep(LENGTH_STEP[UNITS.length] * 10)
+        return sp
+
+    def _q_spin(self, si_m3s) -> _NoScrollSpinBox:
+        """Flow rate spinbox in user's flow unit."""
+        sp = _NoScrollSpinBox()
+        sp.setRange(0.0, UNITS.q(10.0))   # max 10 m³/s
+        sp.setDecimals(FLOW_DECIMALS[UNITS.flow])
+        sp.setSuffix(f" {UNITS.flow}")
+        sp.setValue(UNITS.q(float(si_m3s) if si_m3s is not None else 0.0))
+        sp.setSingleStep(FLOW_STEP[UNITS.flow])
+        return sp
+
+    def _head_spin(self, si_m) -> _NoScrollSpinBox:
+        """Pump head spinbox (length unit, 0 to 10 000 m equiv)."""
+        f = UNITS.l_factor()
+        sp = _NoScrollSpinBox()
+        sp.setRange(0.0, 10_000.0 * f)
+        sp.setDecimals(LENGTH_DECIMALS[UNITS.length])
+        sp.setSuffix(f" {UNITS.length}")
+        sp.setValue(UNITS.l(float(si_m) if si_m is not None else 0.0))
+        sp.setSingleStep(LENGTH_STEP[UNITS.length] * 100)
+        return sp
+
+    # ── Generic (non-unit) spinbox factory ────────────────────────────────
+
+    @staticmethod
+    def _dspin(mn, mx, val, suffix="", decimals=3) -> _NoScrollSpinBox:
+        sp = _NoScrollSpinBox()
+        sp.setRange(mn, mx)
+        sp.setDecimals(decimals)
+        if suffix:
+            sp.setSuffix(f" {suffix}")
+        sp.setValue(float(val) if val is not None else 0.0)
+        sp.setSingleStep(0.001 if decimals >= 3 else 0.1)
+        return sp
+
+    # ── Unit-aware result string helpers ──────────────────────────────────
+
+    def _fmt_p(self, si_bar: float | None) -> str:
+        if si_bar is None:
+            return "—"
+        dec = PRESSURE_RESULT_DEC[UNITS.pressure]
+        return f"{UNITS.p(si_bar):.{dec}f} {UNITS.pressure}"
+
+    def _fmt_q(self, si_m3s: float | None) -> str:
+        if si_m3s is None:
+            return "—"
+        dec = FLOW_RESULT_DEC[UNITS.flow]
+        return f"{UNITS.q(si_m3s):.{dec}f} {UNITS.flow}"
+
+    def _fmt_v(self, si_ms: float | None) -> str:
+        if si_ms is None:
+            return "—"
+        dec = VELOCITY_DECIMALS[UNITS.velocity]
+        return f"{UNITS.v(si_ms):.{dec}f} {UNITS.velocity}"
+
+    # ── Widget helpers ────────────────────────────────────────────────────
 
     def _group(self, title: str) -> QGroupBox:
         grp = QGroupBox(title)
@@ -574,17 +748,6 @@ class PropertiesPanel(QWidget):
         """Insert widget before the trailing stretch."""
         pos = max(self._content_layout.count() - 1, 0)
         self._content_layout.insertWidget(pos, widget)
-
-    @staticmethod
-    def _dspin(mn, mx, val, suffix="", decimals=3) -> QDoubleSpinBox:
-        sp = QDoubleSpinBox()
-        sp.setRange(mn, mx)
-        sp.setDecimals(decimals)
-        if suffix:
-            sp.setSuffix(f" {suffix}")
-        sp.setValue(float(val) if val is not None else 0.0)
-        sp.setSingleStep(0.001 if decimals >= 3 else 0.1)
-        return sp
 
     @staticmethod
     def _result_lbl(text: str) -> QLabel:

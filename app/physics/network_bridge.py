@@ -210,8 +210,9 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
         rho_fluid = 998.2
     g = 9.81
 
-    pump_idx_map:  dict[str, int] = {}   # running pumps → pump table index
-    pump_pipe_map: dict[str, int] = {}   # off pumps    → pipe table index
+    pump_idx_map:       dict[str, int]        = {}  # centrifugal ON pumps → pump table index
+    pump_pipe_map:      dict[str, int]        = {}  # OFF pumps → pipe table index
+    fixed_disp_pump_map: dict[str, tuple[int, int]] = {}  # fixed-disp ON pumps → (j_in, j_out)
 
     for pump_id, pump in model.pumps.items():
         if pump.start_node_id not in j_map or pump.end_node_id not in j_map:
@@ -234,8 +235,27 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
                 pump_pipe_map[pump_id] = idx
             except Exception as exc:
                 warnings.append(f"{pump_id}: could not create off-pump — {exc}")
+
+        elif pump.pump_type == "fixed_displacement":
+            # Fixed displacement: force exact mass flow by injecting a source at
+            # the outlet junction and withdrawing a sink at the inlet junction.
+            # This is the correct pandapipes API for forced-flow elements —
+            # avoids the polynomial-fit instability of create_pump_from_parameters.
+            try:
+                Q_set = max(pump.fixed_flow_m3s, 1e-9)
+                mdot  = rho_fluid * Q_set
+                j_in  = j_map[pump.start_node_id]
+                j_out = j_map[pump.end_node_id]
+                pp.create_sink(net, j_in,  mdot_kg_per_s=mdot,
+                               name=f"fdp_sink_{pump_id}")
+                pp.create_source(net, j_out, mdot_kg_per_s=mdot,
+                                 name=f"fdp_src_{pump_id}")
+                fixed_disp_pump_map[pump_id] = (j_in, j_out)
+            except Exception as exc:
+                warnings.append(f"{pump_id}: could not create fixed-displacement pump — {exc}")
+
         else:
-            # ON pump: use pandapipes pump model with H-Q polynomial
+            # Centrifugal ON pump: H-Q polynomial via pandapipes pump model
             try:
                 pts = sorted(pump.curve_points, key=lambda p: p[0])
                 if len(pts) < 2:
@@ -298,7 +318,7 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
         valve.result_reynolds     = 0.0
         valve.result_regime       = "Closed"
 
-    # ── Extract running pump results ────────────────────────────────────────
+    # ── Extract running centrifugal pump results ────────────────────────────
     for pump_id, pidx in pump_idx_map.items():
         pump = model.pumps[pump_id]
         try:
@@ -322,6 +342,33 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
             pump.result_p_to_bar     = _finite(pt,   0.0)
             pump.result_delta_p_bar  = _finite(-dp,  0.0)   # negative = pressure gain
             pump.result_head_m       = _finite(H,    0.0)
+            pump.result_reynolds     = abs(_finite(Re, 0.0))
+            pump.result_regime       = _regime(abs(_finite(Re, 0.0)))
+        except Exception:
+            pass
+
+    # ── Extract fixed-displacement pump results (from junction pressures) ───
+    for pump_id, (j_in, j_out) in fixed_disp_pump_map.items():
+        pump = model.pumps[pump_id]
+        try:
+            p_in  = _finite(float(net.res_junction.loc[j_in,  "p_bar"]), 0.0)
+            p_out = _finite(float(net.res_junction.loc[j_out, "p_bar"]), 0.0)
+            dp    = p_out - p_in               # positive = pressure gain
+            H     = dp * 1e5 / (rho_fluid * g) if rho_fluid > 0 else 0.0
+            Q_set = pump.fixed_flow_m3s
+            d     = pump.diameter_m
+            A     = math.pi * d**2 / 4.0 if d > 0 else 1e-6
+            v     = Q_set / A if A > 0 else 0.0
+            mdot  = rho_fluid * Q_set
+            Re    = rho_fluid * v * d / 1e-3 if d > 0 else 0.0
+
+            pump.result_velocity_ms  = _finite(v,     0.0)
+            pump.result_flow_m3s     = _finite(Q_set, 0.0)
+            pump.result_mdot_kgs     = _finite(mdot,  0.0)
+            pump.result_p_from_bar   = _finite(p_in,  0.0)
+            pump.result_p_to_bar     = _finite(p_out, 0.0)
+            pump.result_delta_p_bar  = _finite(-dp,   0.0)  # negative = pressure gain
+            pump.result_head_m       = _finite(H,     0.0)
             pump.result_reynolds     = abs(_finite(Re, 0.0))
             pump.result_regime       = _regime(abs(_finite(Re, 0.0)))
         except Exception:
@@ -373,11 +420,19 @@ def _extract_pipe_results(net, elements: dict, idx_map: dict,
 def _pump_head_at_q(pump: PumpData, Q: float) -> float:
     """
     Interpolate pump head (m) from the H-Q curve at volumetric flow Q (m³/s).
-    Returns 0 if pump is off or curve is empty.
+    Returns 0 if pump is off.
+    Fixed-displacement pumps: head is not used for Q calculation (Q is forced
+    directly in _solve_fallback), but we return max_head for compatibility.
     """
-    if not pump.on_off or not pump.curve_points:
+    if not pump.on_off:
         return 0.0
-    pts = sorted(pump.curve_points, key=lambda p: p[0])
+    if pump.pump_type == "fixed_displacement":
+        # Q is forced externally; return max_head so pressure walk is plausible
+        return max(pump.fixed_head_m, 0.1)
+    elif not pump.curve_points:
+        return 0.0
+    else:
+        pts = sorted(pump.curve_points, key=lambda p: p[0])
     # Clamp to curve endpoints
     if Q <= pts[0][0]:
         return float(pts[0][1])
@@ -515,6 +570,12 @@ def _solve_fallback(model: NetworkModel, warnings: list[str]) -> None:
         if abs(Q_new - Q) < 1e-10:
             break
         Q = Q_new
+
+    # Fixed-displacement pump in path: override Q to the set-point
+    for b in path:
+        if isinstance(b, PumpData) and b.on_off and b.pump_type == "fixed_displacement":
+            Q = b.fixed_flow_m3s
+            break
 
     # Clamp to physical range (non-negative)
     Q = max(Q, 0.0)

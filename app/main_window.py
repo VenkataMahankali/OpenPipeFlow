@@ -13,15 +13,16 @@ from __future__ import annotations
 import os
 from PyQt6.QtWidgets import (
     QMainWindow, QDockWidget, QToolBar, QStatusBar,
-    QMessageBox, QFileDialog, QLabel, QWidget, QSizePolicy
+    QMessageBox, QFileDialog, QLabel, QWidget, QSizePolicy, QComboBox
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QSize
 from PyQt6.QtGui import QAction, QKeySequence, QIcon, QColor
 
 from app.canvas.scene        import PipeNetworkScene, PipeNetworkView
-from app.panels.properties_panel import PropertiesPanel
-from app.panels.results_panel    import ResultsPanel
-from app.panels.pid_panel        import PIDPanel
+from app.panels.properties_panel  import PropertiesPanel
+from app.panels.results_panel     import ResultsPanel
+from app.panels.pid_panel         import PIDPanel
+from app.panels.resistance_diagram import ResistanceDiagramDialog
 from app.project.model           import NetworkModel
 from app.project                 import serializer, id_generator
 from app.physics.network_bridge  import solve_network, SolverError
@@ -170,6 +171,12 @@ class MainWindow(QMainWindow):
         act_solve.triggered.connect(self._run_solver)
         tb.addAction(act_solve)
 
+        # Resistance diagram
+        act_rdiag = QAction("R-Diagram", self)
+        act_rdiag.setShortcut(QKeySequence("F6"))
+        act_rdiag.triggered.connect(self._show_resistance_diagram)
+        tb.addAction(act_rdiag)
+
         # Grid toggle
         self._act_grid = QAction("Grid", self)
         self._act_grid.setCheckable(True)
@@ -188,6 +195,41 @@ class MainWindow(QMainWindow):
 
         # Start in select mode
         self._act_select.setChecked(True)
+
+        # ── Units toolbar ─────────────────────────────────────────────────
+        self._setup_units_toolbar()
+
+    def _setup_units_toolbar(self):
+        from app.utils.units import UNITS, PRESSURE_UNITS, FLOW_UNITS, LENGTH_UNITS, VELOCITY_UNITS
+        utb = QToolBar("Units")
+        utb.setMovable(False)
+        utb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, utb)
+
+        def _unit_combo(choices, current, width, unit_type):
+            cb = QComboBox()
+            cb.addItems(list(choices.keys()))
+            cb.setCurrentText(current)
+            cb.setMaximumWidth(width)
+            cb.setStyleSheet("font-size: 11px;")
+            cb.currentTextChanged.connect(
+                lambda t, ut=unit_type: self._on_unit_changed(ut, t))
+            return cb
+
+        utb.addWidget(QLabel("  Units — P:"))
+        utb.addWidget(_unit_combo(PRESSURE_UNITS, UNITS.pressure, 55, "pressure"))
+        utb.addWidget(QLabel("  Q:"))
+        utb.addWidget(_unit_combo(FLOW_UNITS,     UNITS.flow,     75, "flow"))
+        utb.addWidget(QLabel("  L:"))
+        utb.addWidget(_unit_combo(LENGTH_UNITS,   UNITS.length,   50, "length"))
+        utb.addWidget(QLabel("  V:"))
+        utb.addWidget(_unit_combo(VELOCITY_UNITS, UNITS.velocity, 60, "velocity"))
+
+    def _on_unit_changed(self, unit_type: str, value: str):
+        from app.utils.units import UNITS
+        setattr(UNITS, unit_type, value)
+        self._props_panel.refresh()
+        self._scene.update()   # repaint canvas labels in new units
 
     def _set_mode(self, mode: str):
         for act in self._mode_actions:
@@ -260,6 +302,10 @@ class MainWindow(QMainWindow):
         vm.addAction(self._props_dock.toggleViewAction())
         vm.addAction(self._pid_dock.toggleViewAction())
         vm.addAction(self._results_dock.toggleViewAction())
+        vm.addSeparator()
+        vm.addAction(act("Resistance Diagram (F6)",
+                         self._show_resistance_diagram,
+                         QKeySequence("F6")))
 
         # Simulation
         sm = mb.addMenu("&Simulation")
@@ -503,6 +549,10 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel
         )
         return reply == QMessageBox.StandardButton.Discard
+
+    def _show_resistance_diagram(self):
+        dlg = ResistanceDiagramDialog(self._model, self)
+        dlg.show()   # non-modal — stays open while user works
 
     def _show_about(self):
         QMessageBox.about(

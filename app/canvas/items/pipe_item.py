@@ -11,12 +11,13 @@ Features:
 
 from __future__ import annotations
 import math
-from PyQt6.QtWidgets import QGraphicsItem
-from PyQt6.QtCore import Qt, QRectF, QPointF, QLineF
+from PyQt6.QtWidgets import QGraphicsItem, QMenu
+from PyQt6.QtCore import Qt, QRectF, QPointF, QLineF, QTimer
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QPainterPath, QLinearGradient,
     QPolygonF
 )
+from app.utils.units import UNITS, VELOCITY_DECIMALS, PRESSURE_DECIMALS
 
 from app.canvas.items.base_item import BaseItem
 from app.utils.constants import (
@@ -198,10 +199,11 @@ class PipeItem(BaseItem):
 
         # Velocity / ΔP — just below the tag name
         if self._velocity_ms is not None:
-            q_lpm = (self._flow_m3s or 0.0) * 60000.0
-            ann = f"{self._velocity_ms:.2f} m/s"
+            v_dec = VELOCITY_DECIMALS[UNITS.velocity]
+            ann = f"{UNITS.v(self._velocity_ms):.{v_dec}f} {UNITS.velocity}"
             if self._dp_bar is not None:
-                ann += f"  dP={self._dp_bar:.3f} bar"
+                p_dec = PRESSURE_DECIMALS[UNITS.pressure]
+                ann += f"  dP={UNITS.p(self._dp_bar):.{p_dec}f} {UNITS.pressure}"
             self._paint_label(painter, ann,
                               lx, ly + 3, align_center=True)
 
@@ -212,6 +214,23 @@ class PipeItem(BaseItem):
             sel_pen.setStyle(Qt.PenStyle.DotLine)
             painter.setPen(sel_pen)
             painter.drawLine(s, e)
+
+    # ── Context menu (inherited by ValveItem and PumpItem) ─────────────────
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        menu.addAction("Properties",
+                       lambda: self.double_clicked.emit(self._element_id))
+        menu.addSeparator()
+        act_del = menu.addAction("Delete")
+        chosen = menu.exec(event.screenPos())
+        if chosen == act_del:
+            sc = self.scene()
+            if sc:
+                sc.clearSelection()
+                self.setSelected(True)
+                QTimer.singleShot(0, sc.delete_selected)
+        event.accept()
 
     def _draw_flow_arrows(self, painter: QPainter, s: QPointF, e: QPointF,
                           colour: QColor):
