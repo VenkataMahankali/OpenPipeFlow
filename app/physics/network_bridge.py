@@ -167,14 +167,24 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
         except Exception as exc:
             warnings.append(f"{pid}: could not create pipe — {exc}")
 
-    # ── Valve elements (modelled as short pipes with K-loss) ───────────────
-    valve_idx_map: dict[str, int] = {}
+    # ── Valve elements ─────────────────────────────────────────────────────
+    # CLOSED valves are NOT added to the pandapipes network.
+    # This creates a topological break: pandapipes sees dead-end pipe segments
+    # on each side, which it correctly solves with exactly zero flow and the
+    # appropriate static pressure (source pressure on inlet side, sink on outlet).
+    # OPEN valves are modelled as short pipes with a K-factor loss.
+    valve_idx_map:    dict[str, int] = {}
+    closed_valve_ids: set[str]       = set()
+
     for vid, valve in model.valves.items():
         if valve.start_node_id not in j_map or valve.end_node_id not in j_map:
             warnings.append(f"{vid}: endpoint not found, skipping.")
             continue
+        if not valve.is_open:
+            # Fully closed: omit from network; results written after solve
+            closed_valve_ids.add(vid)
+            continue
         try:
-            loss = valve.effective_k if valve.is_open else 1e6
             idx = pp.create_pipe_from_parameters(
                 net,
                 from_junction=j_map[valve.start_node_id],
@@ -182,7 +192,7 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
                 length_km=max(valve.length_m / 1000.0, 1e-6),
                 diameter_m=valve.diameter_m,
                 k_mm=0.045,
-                loss_coefficient=loss,
+                loss_coefficient=valve.effective_k,
                 name=valve.name,
             )
             valve_idx_map[vid] = idx
@@ -268,6 +278,25 @@ def _solve_pandapipes(model: NetworkModel, warnings: list[str]) -> None:
     _extract_pipe_results(net, model.pipes, pipe_idx_map, rho_fluid)
     _extract_pipe_results(net, model.valves, valve_idx_map, rho_fluid)
     _extract_pipe_results(net, model.pumps, pump_pipe_map, rho_fluid)  # OFF pumps
+
+    # ── Write CLOSED valve results (zero flow; pressures from junctions) ───
+    for vid in closed_valve_ids:
+        valve = model.valves[vid]
+        jf_idx = j_map.get(valve.start_node_id)
+        jt_idx = j_map.get(valve.end_node_id)
+        try:
+            pf = _finite(net.res_junction.loc[jf_idx, "p_bar"], 0.0) if jf_idx is not None else 0.0
+            pt = _finite(net.res_junction.loc[jt_idx, "p_bar"], 0.0) if jt_idx is not None else 0.0
+        except Exception:
+            pf, pt = 0.0, 0.0
+        valve.result_velocity_ms  = 0.0
+        valve.result_flow_m3s     = 0.0
+        valve.result_mdot_kgs     = 0.0
+        valve.result_p_from_bar   = pf
+        valve.result_p_to_bar     = pt
+        valve.result_delta_p_bar  = pf - pt
+        valve.result_reynolds     = 0.0
+        valve.result_regime       = "Closed"
 
     # ── Extract running pump results ────────────────────────────────────────
     for pump_id, pidx in pump_idx_map.items():
